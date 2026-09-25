@@ -141,4 +141,4 @@ During a **single capture**, the image is displayed in the interface and can be 
 
 ## License
 
-*(to be completed according to the license chosen for this project)*
+
