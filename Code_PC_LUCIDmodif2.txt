@@ -1,0 +1,1390 @@
+import os
+import sys
+import time
+import ctypes
+import numpy as np
+import cv2
+import datetime
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QLabel, QPushButton, QVBoxLayout,
+    QHBoxLayout, QGroupBox, QListWidget, QComboBox, QFileDialog, QTabWidget,
+    QMenu, QAction, QGridLayout, QScrollArea, QLineEdit, QSpinBox, QMessageBox,
+    QProgressBar, QSlider
+)
+from PyQt5.QtCore import Qt, QTimer, QDateTime
+from PyQt5.QtGui import QImage, QPixmap, QContextMenuEvent
+from arena_api.system import system
+from arena_api.buffer import BufferFactory
+from arena_api.enums import PixelFormat
+from arena_api.__future__.save import Writer
+from pathlib import Path   
+import matplotlib.pyplot as plt
+from matplotlib import colors
+from io import BytesIO
+import scipy.io as sio  
+
+    
+
+def detect_sun_line_hough(aopl_deg, AZIMUT_OFFSET, epsilon_deg=5):
+    """
+    Estime l'azimut solaire par transformée de Hough sur les pixels
+    dont l'AoLP est proche de 90° (perpendiculaire au soleil).
+
+    Entrées :
+        aopl_deg       - matrice 2D de l'AoLP (degrés, 0-180)
+        AZIMUT_OFFSET  - angle de l'axe X de la caméra par rapport au Nord (°)
+        epsilon_deg    - demi-largeur de la bande autour de 90° (défaut 5°)
+
+    Sorties :
+        Az_sun_est     - azimut solaire estimé (degrés, 0-360)
+        line_angle     - angle de la ligne détectée / horizontale (degrés)
+    """
+
+    # 1. Masque binaire : pixels dont AoLP ≈ 90°
+    target = 90.0
+    diff = np.abs(aopl_deg - target)
+    # Gérer la circularité 0°/180°
+    diff = np.minimum(diff, 180.0 - diff)
+    bw = (diff < epsilon_deg).astype(np.uint8) * 255
+
+    pct_pixels = (bw > 0).mean() * 100
+    print(f"Pixels AoLP≈90° : {pct_pixels:.1f}%")
+
+    if pct_pixels < 0.1:
+        print("⚠️ Trop peu de pixels — augmenter epsilon_deg")
+        return None, None
+
+    # 2. Dilatation verticale pour relier les points
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 5))
+    bw_dilated = cv2.dilate(bw, kernel)
+
+    # 3. Transformée de Hough probabiliste
+    lines = cv2.HoughLinesP(
+        bw_dilated,
+        rho=1,
+        theta=np.pi / 180,
+        threshold=30,
+        minLineLength=20,
+        maxLineGap=10
+    )
+
+    if lines is None:
+        print("⚠️ Aucune ligne détectée par Hough")
+        return None, None
+
+    # 4. Trouver la ligne dominante (la plus longue)
+    best_line = None
+    best_length = 0
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        length = np.sqrt((x2-x1)**2 + (y2-y1)**2)
+        if length > best_length:
+            best_length = length
+            best_line = line[0]
+
+    x1, y1, x2, y2 = best_line
+    dx = x2 - x1
+    dy = y2 - y1
+
+    # Angle de la ligne par rapport à l'horizontale
+    line_angle = float(np.degrees(np.arctan2(dy, dx)) % 180.0)
+    print(f"Angle ligne Hough : {line_angle:.1f}°")
+
+    # 5. Azimut solaire — soleil perpendiculaire à la ligne
+    Az_sun_est = float((line_angle + AZIMUT_OFFSET + 90.0) % 360.0)
+    print(f"Azimut solaire estimé : {Az_sun_est:.1f}°")
+
+    return Az_sun_est, line_angle
+
+
+def visualiser_hough(aopl_deg, Az_sun_est, line_angle, epsilon_deg=5):
+    """
+    Visualise le masque AoLP≈90° et la ligne Hough détectée.
+    Retourne une image BGR pour affichage Qt.
+    """
+    # Image AoLP normalisée en niveaux de gris
+    aopl_norm = cv2.normalize(
+        aopl_deg.astype(np.float32), None,
+        0, 255, cv2.NORM_MINMAX
+    ).astype(np.uint8)
+    viz = cv2.cvtColor(aopl_norm, cv2.COLOR_GRAY2BGR)
+
+    # Masque AoLP≈90° en rouge
+    target = 90.0
+    diff = np.minimum(np.abs(aopl_deg - target), 180.0 - np.abs(aopl_deg - target))
+    bw = (diff < epsilon_deg).astype(np.uint8)
+    viz[bw > 0] = [0, 0, 255]  # rouge
+
+    # Ligne estimée en vert au centre
+    h, w = aopl_deg.shape
+    cx, cy = w // 2, h // 2
+    angle_rad = np.radians(line_angle)
+    length = min(h, w) // 2
+    dx = int(np.cos(angle_rad) * length)
+    dy = int(np.sin(angle_rad) * length)
+    cv2.line(viz, (cx - dx, cy - dy), (cx + dx, cy + dy), (0, 255, 0), 2)
+
+    # Texte
+    cv2.putText(
+        viz,
+        f"Az={Az_sun_est:.1f}  Ligne={line_angle:.1f}",
+        (10, 30),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7, (255, 255, 255), 2
+    )
+
+    return viz
+
+# Allow right-click saving of the image it displays
+class ClickableLabel(QLabel):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.image_data = None
+        self.filename = None
+
+    def contextMenuEvent(self, event: QContextMenuEvent):
+        if self.image_data is not None:
+            menu = QMenu(self)
+            save_action = QAction("Save image", self)
+            save_action.triggered.connect(self.save_image)
+            menu.addAction(save_action)
+            menu.exec_(event.globalPos())
+
+    def save_image(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Save image", self.filename or "capture.png", "Images (*.png *.jpg)")
+        if path:
+            cv2.imwrite(path, self.image_data)
+            print(f"Image saved at: {path}")
+
+
+# Main window
+class ArenaLikeGUI(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Polarized Camera Control Software")
+        self.setGeometry(100, 100, 1400, 850)
+        self.device = None
+        self.timer = None
+        self.captures = []
+
+        # Central widget and main layout
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QHBoxLayout()
+        sidebar = QVBoxLayout()
+
+        # === Camera detection ===
+        self.camera_group = QGroupBox("\U0001F4F7 Detected Cameras")
+        camera_list = QListWidget()
+
+        tries = 0
+        tries_max = 6
+        while tries < tries_max:
+            devices = system.create_device()
+            if not devices:
+                print(f"Try {tries+1} of {tries_max}: waiting for a device to be connected!")
+                time.sleep(10)
+                tries += 1
+            else:
+                self.device = system.select_device(devices)
+                break
+
+        self.nodemap = self.device.nodemap
+        self.tl_stream_nodemap = self.device.tl_stream_nodemap
+
+        list_label = QLabel(f'{len(devices)} camera(s) detected\n')
+        camera_list.addItem(f'{self.device}')
+
+        cam_layout = QVBoxLayout()
+        cam_layout.addWidget(camera_list)
+        cam_layout.addWidget(list_label)
+        self.camera_group.setLayout(cam_layout)
+        self.camera_group.setFixedHeight(300)
+        
+        ### Temperature
+        temperature_node = self.nodemap.get_node("DeviceTemperature")
+        if temperature_node is not None:
+            temperature_value = temperature_node.value
+            print(f"Device actual temperature : {temperature_value:.4f} °C")     
+
+        # === Settings group ===
+        self.options_group = QGroupBox("\u2699\ufe0f Settings")
+        options_layout = QVBoxLayout()
+        
+        # create slider for parameters
+        def create_slider(label_text, minimum, maximum, default, step=1):
+            layout = QVBoxLayout()
+            label = QLabel(f"{label_text}: {default}")
+            slider = QSlider(Qt.Horizontal)
+            slider.setMinimum(minimum)
+            slider.setMaximum(maximum)
+            slider.setSingleStep(step)
+            slider.setValue(default)
+            layout.addWidget(label)
+            layout.addWidget(slider)
+            return layout, label, slider
+
+        # GAIN
+        gain_layout, self.gain_label, self.gain_slider = create_slider("Gain (dB)", 0, 48, 0)
+        self.gain_slider.valueChanged.connect(lambda val: self.gain_label.setText(f"Gain (dB): {val}"))
+        options_layout.addLayout(gain_layout)
+
+        # EXPOSURE TIME (µs)
+        expo_layout, self.expo_label, self.expo_slider = create_slider("Temps d'expo (µs)", 33, 47381, 20000)
+        self.expo_slider.valueChanged.connect(lambda val: self.expo_label.setText(f"Exposure time (µs): {val}"))
+        options_layout.addLayout(expo_layout)
+        
+        # === Live preview controls ===
+        visual_label = QLabel("Live view")
+        visual_label.setStyleSheet("font-weight: bold; font-size: 12px")
+        options_layout.addWidget(visual_label)
+        btn_layout = QHBoxLayout()
+        self.visualiser_start_button = QPushButton("Start")
+        self.visualiser_start_button.clicked.connect(self.lancer_previsualisation)
+        btn_layout.addWidget(self.visualiser_start_button)
+        self.visualiser_stop_button = QPushButton("Stop")
+        self.visualiser_stop_button.clicked.connect(self.arreter_previsualisation)
+        btn_layout.addWidget(self.visualiser_stop_button)
+        options_layout.addLayout(btn_layout)
+
+        # === Single image capture ===
+        format_label_1 = QLabel("Take an image")
+        format_label_1.setStyleSheet("font-weight: bold; font-size: 12px")
+        format_label_2 = QLabel("Image format")
+        options_layout.addWidget(format_label_1)
+        options_layout.addWidget(format_label_2)
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems([
+            "Raw Image","Global Angle of Polarization (AOPG)",
+             "Local Angle of Polarization (AOPL)", "Degree of Polarization (DoP)",
+            ])
+        options_layout.addWidget(self.mode_combo)
+        self.capture_button = QPushButton("Capture")
+        self.capture_button.clicked.connect(self.capture_image)
+        options_layout.addWidget(self.capture_button)
+        
+        # === Series acquisition controls ===
+        format_label_1 = QLabel("Take image series")
+        format_label_1.setStyleSheet("font-weight: bold; font-size: 12px")
+        options_layout.addWidget(format_label_1)
+        
+        # Total duration
+        format_label_2 = QLabel("Total duration")
+        options_layout.addWidget(format_label_2)
+        duration_layout = QHBoxLayout()
+        self.duration_spinbox = QSpinBox()
+        self.duration_spinbox.setMinimum(1)
+        self.duration_spinbox.setMaximum(9999)
+        self.duration_spinbox.setValue(1)
+        duration_layout.addWidget(self.duration_spinbox)
+        self.duration_unit_combobox = QComboBox()
+        self.duration_unit_combobox.addItems(["seconds", "minutes", "hours", "days"])
+        duration_layout.addWidget(self.duration_unit_combobox)
+        options_layout.addLayout(duration_layout)
+        
+        # Series time period
+        format_label_3 = QLabel("Series time period")
+        options_layout.addWidget(format_label_3)
+        interval_layout = QHBoxLayout()
+        self.interval_spinbox = QSpinBox()
+        self.interval_spinbox.setMinimum(1)
+        self.interval_spinbox.setMaximum(9999)
+        self.interval_spinbox.setValue(1)  # Valeur par défaut
+        interval_layout.addWidget(self.interval_spinbox)
+        self.interval_unit_combobox = QComboBox()
+        self.interval_unit_combobox.addItems(["miliseconds","seconds", "minutes", "hours"])
+        interval_layout.addWidget(self.interval_unit_combobox)
+        options_layout.addLayout(interval_layout)
+               
+        # Select directory
+        format_label_4 = QLabel("Directory")
+        path_layout = QHBoxLayout()
+        self.path_line_edit = QLineEdit()
+        self.path_line_edit.setReadOnly(True)
+        self.path_line_edit.setText("No directory selected")  # Valeur par défaut
+        path_layout.addWidget(self.path_line_edit)
+        self.browse_button = QPushButton("...")
+        self.browse_button.setFixedWidth(30)
+        self.browse_button.clicked.connect(self.select_save_path)
+        path_layout.addWidget(self.browse_button)
+        options_layout.addWidget(format_label_4)
+        options_layout.addLayout(path_layout) 
+        
+        # Buttons to start acquisition
+        btn_layout = QHBoxLayout()
+        self.acquisition_start_button = QPushButton("Start")
+        self.acquisition_start_button.clicked.connect(self.lancer_acquisition)
+        btn_layout.addWidget(self.acquisition_start_button)
+        self.acquisition_stop_button = QPushButton("Stop")
+        self.acquisition_stop_button.clicked.connect(self.arreter_acquisition)
+        btn_layout.addWidget(self.acquisition_stop_button)
+        options_layout.addLayout(btn_layout)
+        
+        # Progression bar
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setMinimum(0)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("%v / %m images")
+        self.progress_bar.setAlignment(Qt.AlignCenter)
+        self.progress_bar.setStyleSheet("QProgressBar::chunk { background-color: #3498db; }")
+        options_layout.addWidget(self.progress_bar)
+        
+        self.options_group.setFixedHeight(550)
+        self.options_group.setLayout(options_layout)
+        
+        # === Tabs in the right ===
+        self.tabs = QTabWidget()
+        self.tabs.setTabsClosable(False)
+
+        # Live stream
+        self.preview_tab = QWidget()
+        preview_layout = QVBoxLayout()
+        self.live_label = QLabel("Live Stream")
+        self.live_label.setStyleSheet("color: grey")
+        self.live_label.setAlignment(Qt.AlignCenter)
+        self.live_label.setFixedSize(1200, 800)
+        self.live_label.setStyleSheet("background-color: #111; border: 1px solid white")
+        preview_layout.addWidget(self.live_label)
+        self.preview_tab.setLayout(preview_layout)
+        self.tabs.addTab(self.preview_tab, "Live view")
+
+        # Result (from single image capture)
+        self.result_tab = QWidget()
+        self.result_layout = QGridLayout() 
+        self.result_container = QWidget()
+        self.result_layout.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
+        self.result_container.setLayout(self.result_layout)
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setWidget(self.result_container)
+        self.tabs.addTab(self.scroll_area, "Result")
+        self.result_widgets = [] 
+        
+        # Acquisition (from acquisition series)
+        self.acquisition_tab = QWidget()
+        self.acquisition_layout = QVBoxLayout()
+        self.acquisition_tab.setLayout(self.acquisition_layout)
+        self.result_layout.setAlignment(Qt.AlignTop)
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setWidget(self.acquisition_tab)
+        self.tabs.addTab(self.scroll_area, "Acquisition")   
+
+        ### Assemble main layout
+        sidebar.addWidget(self.camera_group)
+        sidebar.addWidget(self.options_group)
+        main_layout.addLayout(sidebar, 1)
+        main_layout.addWidget(self.tabs, 3)
+        central_widget.setLayout(main_layout)
+
+    # Update camera setting 
+    def update_camera_settings(self):
+        gain_node = self.device.nodemap.get_node("Gain")
+        exposure_node = self.device.nodemap.get_node("ExposureTime")
+        gain_value = self.gain_slider.value()
+        exposure_value = self.expo_slider.value()
+
+        if gain_node:
+            gain_node.value = float(gain_value)
+
+        if exposure_node:
+            exposure_node.value = float(exposure_value)
+            
+    # Start the live stream preview with current gain and exposure settings
+    def lancer_previsualisation(self):
+        gain = self.gain_slider.value()
+        expo = self.expo_slider.value()
+        
+        nodes = self.nodemap.get_node(['PixelFormat', 'Gain', 'GainAuto', 'ExposureTime', 'ExposureAuto',
+        'AcquisitionFrameRate', 'AcquisitionFrameRateEnable'])
+        nodes['PixelFormat'].value = 'Mono12'
+        nodes['GainAuto'].value = 'Off'
+        nodes['ExposureAuto'].value = 'Off'
+        nodes['AcquisitionFrameRateEnable'].value = True
+        nodes['Gain'].value = float(gain)
+        nodes['ExposureTime'].value = float(expo)
+        
+        self.update_camera_settings()
+        self.gain_slider.valueChanged.connect(self.update_camera_settings)
+        self.expo_slider.valueChanged.connect(self.update_camera_settings)
+
+        self.tl_stream_nodemap['StreamBufferHandlingMode'].value = 'NewestOnly'
+        self.tl_stream_nodemap['StreamAutoNegotiatePacketSize'].value = True
+        self.tl_stream_nodemap['StreamPacketResendEnable'].value = True
+
+        self.device.start_stream()
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.afficher_flux)
+        self.timer.start(30)
+        self.capture_button.setEnabled(False)
+        
+    # Capture and display a frame from the live stream
+    def afficher_flux(self):
+        buffer = self.device.get_buffer()
+        item = BufferFactory.copy(buffer)
+        self.device.requeue_buffer(buffer)
+        bpp = int(len(item.data) / (item.width * item.height))
+
+        if bpp == 2:  # Mono12 is encoded on 2 bytes per pixel
+            # raw data to uint6
+            array = (ctypes.c_ushort * (item.width * item.height)).from_address(ctypes.addressof(item.pbytes))
+            frame_16 = np.ndarray(buffer=array, dtype=np.uint16, shape=(item.height, item.width))
+
+            # Scalling data into 8 bit format (division per 16)
+            frame_8 = (frame_16 / 16).astype(np.uint8)
+            qimg = QImage(frame_8.data, frame_8.shape[1], frame_8.shape[0], frame_8.strides[0], QImage.Format_Grayscale8)
+            self.live_label.setPixmap(QPixmap.fromImage(qimg).scaled(1200, 800, Qt.KeepAspectRatio))
+
+        elif bpp == 1:  # If it is Mono8 format
+            array = (ctypes.c_ubyte * item.width * item.height).from_address(ctypes.addressof(item.pbytes))
+            frame = np.ndarray(buffer=array, dtype=np.uint8, shape=(item.height, item.width))
+
+            qimg = QImage(frame.data, frame.shape[1], frame.shape[0], frame.strides[0], QImage.Format_Grayscale8)
+            self.live_label.setPixmap(QPixmap.fromImage(qimg).scaled(1200, 800, Qt.KeepAspectRatio))
+
+        else:
+            print(f"Unsupported BPP: {bpp}")
+
+        BufferFactory.destroy(item)
+
+    # Stop the live stream and re-enable the capture button
+    def arreter_previsualisation(self):
+        if self.timer and self.timer.isActive():
+            self.timer.stop()
+            self.device.stop_stream()
+        self.capture_button.setEnabled(True)
+
+
+    # Refresh the result display grid with the most recent image captures
+    def rafraichir_grille_resultats(self):
+        for i in reversed(range(self.result_layout.count())):
+            widget = self.result_layout.itemAt(i).widget()
+            if widget:
+                self.result_layout.removeWidget(widget)
+                widget.setParent(None)
+
+        # Display widget in 3x3 grid 
+        for idx, (title, label, bar) in enumerate(self.result_widgets):
+            row = idx // 3
+            col = idx % 3
+            self.result_layout.addWidget(title, row * 3, col)
+            self.result_layout.addWidget(label, row * 3 + 1, col)
+            self.result_layout.addWidget(bar, row * 3 + 2, col) 
+    
+
+    def auto_expose(self, target_mean=120, tolerance=15, max_iter=8):
+        """
+        Ajuste automatiquement l'exposition pour obtenir une mean cible.
+        Retourne True si convergé, False sinon.
+        """
+        exposure_node = self.device.nodemap.get_node("ExposureTime")
+        gain_node = self.device.nodemap.get_node("Gain")
+        nodes = self.device.nodemap.get_node(['Width', 'Height', 'PixelFormat'])
+
+        # Désactiver les autos
+        auto_exp = self.device.nodemap.get_node("ExposureAuto")
+        auto_gain = self.device.nodemap.get_node("GainAuto")
+        if auto_exp: auto_exp.value = "Off"
+        if auto_gain: auto_gain.value = "Off"
+
+        exp_min = exposure_node.min
+        exp_max = exposure_node.max
+        gain_min = gain_node.min
+        gain_max = gain_node.max
+
+        # Partir d'une exposition basse en extérieur
+        exposure_node.value = float(max(exp_min, 5000.0))
+        gain_node.value = float(gain_min)
+
+        for i in range(max_iter):
+            # Capture rapide pour mesure
+            with self.device.start_stream():
+                image_buffer = self.device.get_buffer()
+                raw = np.ctypeslib.as_array(
+                    image_buffer.pdata,
+                    shape=(image_buffer.height, image_buffer.width)
+                ).astype(np.float32)
+                self.device.requeue_buffer(image_buffer)
+                self.device.stop_stream()
+
+            # Mesure sur patch central uniquement
+            h, w = raw.shape
+            cy, cx = h // 2, w // 2
+            patch = raw[cy-50:cy+50, cx-50:cx+50]
+        
+            # Exclure pixels saturés
+            mask = patch < 200
+            if mask.sum() == 0:
+                current_mean = 255.0
+            else:
+                current_mean = patch[mask].mean()
+    
+            current_exp = exposure_node.value
+            print(f"Iter {i+1}: expo={current_exp:.1f}µs  mean={current_mean:.1f}/201")
+
+            # Vérifier convergence
+            if abs(current_mean - target_mean) <= tolerance:
+                print(f"✅ Convergé en {i+1} itérations — mean={current_mean:.1f}")
+                return True
+
+            # Saturation totale → baisser fortement
+            if current_mean >= 200:
+                exposure_node.value = max(exp_min, current_exp * 0.3)
+                continue
+
+            # Trop sombre → augmenter
+            if current_mean < target_mean - tolerance:
+                ratio = float(target_mean) / float(max(current_mean, 1.0))
+                new_exp = float(min(exp_max, current_exp * ratio))
+                if new_exp >= exp_max and current_mean < 30:
+                    # Exposition max atteinte → monter le gain
+                    new_gain = float(min(gain_max, gain_node.value + 3.0))
+                    gain_node.value = new_gain
+                    print(f"  → Gain augmenté à {new_gain:.1f} dB")
+                else:
+                    exposure_node.value = new_exp
+
+            # Trop lumineux → baisser
+            elif current_mean > target_mean + tolerance:
+                ratio = float(target_mean) / float(current_mean)
+                new_exp = float(max(exp_min, current_exp * ratio))
+                exposure_node.value = new_exp
+                # Baisser aussi le gain si possible
+                if gain_node.value > gain_min:
+                    gain_node.value = float(max(gain_min, gain_node.value - 3.0))
+
+        print(f"⚠️ Non convergé après {max_iter} itérations — mean finale={current_mean:.1f}")
+        return False
+
+        
+    
+
+    # Capture a single image based on the format selected in the combo box. The supported formats are Raw Image, DoP, AOPG, and AOPL.
+    def capture_image(self):
+        self.arreter_previsualisation()
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        
+        # Format selected in the drop-down list
+        format_selected = self.mode_combo.currentText()
+        
+        #--------- THIS SECTION IS BASED ON ARENAVIEW's CODE -------  
+        # === RAW IMAGE FORMAT ===
+        if format_selected == "Raw Image":
+            # Pixel format configuration
+            tl_stream_nodemap = self.device.tl_stream_nodemap
+            
+            # Auto-exposition avant capture
+            self.auto_expose(target_mean=30, tolerance=15, max_iter=8)
+
+            exposure_node = self.device.nodemap.get_node("ExposureTime")
+            gain_node = self.device.nodemap.get_node("Gain")
+            exposure_value = exposure_node.value
+            gain_value = gain_node.value
+            
+            
+            tl_stream_nodemap['StreamAutoNegotiatePacketSize'].value = True
+            tl_stream_nodemap['StreamPacketResendEnable'].value = True
+
+            nodes = self.device.nodemap.get_node(['Width', 'Height', 'PixelFormat'])
+            nodes['Width'].value = nodes['Width'].max
+            nodes['Height'].value = nodes['Height'].max
+            nodes['PixelFormat'].value = 'BayerRG12' 
+
+            width = nodes['Width'].value
+            height = nodes['Height'].value
+
+
+       
+
+            # Capture
+            with self.device.start_stream():
+                image_buffer = self.device.get_buffer()
+                raw_bytes = image_buffer.data
+
+                # Direct interpretation : every pixel = 2 bits
+                image_16bit = np.frombuffer(bytes(raw_bytes), dtype=np.uint16).reshape((height, width))
+                green1 = image_16bit[0::2, 1::2]
+                green2 = image_16bit[1::2, 0::2]
+
+                green = ((green1.astype(np.uint32) +
+                          green2.astype(np.uint32)) // 2).astype(np.uint16)
+
+                green_norm = cv2.normalize(
+                    green.astype(np.float32), None,
+                    alpha=0, beta=255,
+                    norm_type=cv2.NORM_MINMAX
+                ).astype(np.uint8)
+
+                image_8bit = green_norm
+
+               
+
+                # Display result with PyQt
+                label = ClickableLabel()
+                label.setFixedSize(550, 350)
+
+                qimg = QImage(
+                    image_8bit.data,
+                    image_8bit.shape[1],
+                    image_8bit.shape[0],
+                    image_8bit.strides[0],
+                    QImage.Format_Grayscale8
+                )
+                pixmap = QPixmap.fromImage(qimg).scaled(550, 350, Qt.KeepAspectRatio)
+                label.setPixmap(pixmap)
+                label.setAlignment(Qt.AlignCenter)
+                label.image_data = image_16bit.copy()
+                label.filename = f"Raw_image_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_G:{gain_value}_E:{exposure_value}.png"
+
+                # Title
+                title = QLabel(f"{format_selected} on {datetime.datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
+                title.setAlignment(Qt.AlignCenter)
+                title.setStyleSheet("color: grey; font-weight: bold; font-size: 14px")
+
+                # Placeholder below (this part display nothing, but we need it for visualisation structure)
+                bar_placeholder = QLabel()
+                bar_placeholder.setFixedHeight(20)
+                bar_placeholder.setStyleSheet("background: none;")
+
+                # Display result
+                if len(self.result_widgets) >= 9:
+                    self.result_widgets.pop(0)
+
+                self.result_widgets.append((title, label, bar_placeholder))
+                self.rafraichir_grille_resultats()
+
+                # Stop capture
+                QApplication.processEvents()
+                time.sleep(0.1)
+                self.device.requeue_buffer(image_buffer)
+                self.device.stop_stream()
+
+
+        # === DEGREE OF POLARIZATION FORMAT (DOP) ===
+        elif format_selected == "Degree of Polarization (DoP)":
+            # INSPIRED FROM : C:\ProgramData\Lucid Vision Labs\ArenaView\ArenaJp\Jupyter Source Code Examples\py_image_buffer_save_PolarizedDolp_BayerRG8_to_png_with_opencv
+            
+            # Setup stream nodes
+            tl_stream_nodemap = self.device.tl_stream_nodemap
+            
+            gain_node = self.device.nodemap.get_node("Gain")
+            exposure_node = self.device.nodemap.get_node("ExposureTime")
+            gain_value = self.gain_slider.value()
+            exposure_value = self.expo_slider.value()
+            if gain_node:
+                gain_node.value = float(gain_value)
+            if exposure_node:
+                exposure_node.value = float(exposure_value)
+                
+            tl_stream_nodemap['StreamAutoNegotiatePacketSize'].value = True
+            tl_stream_nodemap['StreamPacketResendEnable'].value = True
+
+            # Configure camera nodes
+            nodes = self.device.nodemap.get_node(['Width', 'Height', 'PixelFormat'])
+            nodes['Width'].value = nodes['Width'].max
+            height = nodes['Height']
+            height.value = height.max
+
+            # Set pixel format to PolarizedDolp_BayerRG8
+            pixel_format_name = 'PolarizedDolp_BayerRG8'
+            nodes['PixelFormat'].value = pixel_format_name
+            
+            # Capture
+            with self.device.start_stream():
+                image_buffer = self.device.get_buffer() 
+                nparray_reshaped = np.ctypeslib.as_array(image_buffer.pdata, shape=(image_buffer.height, image_buffer.width))
+                
+                ## Image
+                # Image conversion for colormap
+                image_float = nparray_reshaped.astype(np.float32)
+                image_float = np.nan_to_num(image_float)
+                image_norm = cv2.normalize(image_float, None, 0, 255, cv2.NORM_MINMAX)
+                image_uint8 = image_norm.astype(np.uint8)
+                cm_nparray = cv2.applyColorMap(image_uint8, cv2.COLORMAP_VIRIDIS)
+                
+                # Qt part
+                height, width, channel = cm_nparray.shape
+                bytes_per_line = 3 * width
+                qimg = QImage(cm_nparray.data, width, height, bytes_per_line, QImage.Format_RGB888)
+                
+                # Cliquable label with the image (Right clic on the image with the mouse)
+                label = ClickableLabel()
+                label.setFixedSize(550, 350)
+                label.setAlignment(Qt.AlignCenter)
+                label.setPixmap(QPixmap.fromImage(qimg).scaled(550, 350, Qt.KeepAspectRatio))
+                label.image_data = cm_nparray.copy()
+                label.filename = f"DOP_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_G:{gain_value}_E:{exposure_value}.png"
+
+                ## Title above
+                title = QLabel(f"{format_selected} on {datetime.datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
+                title.setAlignment(Qt.AlignCenter)
+                title.setStyleSheet("color: grey; font-weight: bold; font-size: 14px")
+                
+                ## Creation of Colorbar below
+                # colorbar via matplotlib
+                fig, ax = plt.subplots(figsize=(5, 0.5))
+                fig.subplots_adjust(bottom=0.5)
+
+                # vmin, vmax according to the format
+                norm = colors.Normalize(vmin=0.0, vmax=1.0)
+                cbar = plt.colorbar(
+                    plt.cm.ScalarMappable(norm=norm, cmap='viridis'),
+                    cax=ax,
+                    orientation='horizontal'
+                )
+                cbar.set_label('Degree of Polarization - DoP')
+
+                ## Save buffer in the memory
+                buf = BytesIO()
+                plt.savefig(buf, format='png', bbox_inches='tight', pad_inches=0.1)
+                plt.close(fig) 
+
+                ## Reading the captured buffer and conversion for Qt
+                buf.seek(0)
+                colorbar_array = np.frombuffer(buf.getvalue(), dtype=np.uint8)
+                colorbar_img = cv2.imdecode(colorbar_array, cv2.IMREAD_COLOR)
+
+                ## Conversion to QPixmap
+                height, width, channel = colorbar_img.shape
+                bytes_per_line = 3 * width
+                qimg_bar = QImage(colorbar_img.data, width, height, bytes_per_line, QImage.Format_RGB888)
+                qpixmap_bar = QPixmap.fromImage(qimg_bar)
+
+                ## Add colorbar below the image
+                bar_label = QLabel()
+                bar_label.setPixmap(qpixmap_bar)
+                bar_label.setAlignment(Qt.AlignCenter)
+                
+                ## Display result
+                if len(self.result_widgets) >= 9:
+                    self.result_widgets.pop(0)
+
+                self.result_widgets.append((title, label, bar_label))
+                self.rafraichir_grille_resultats()
+
+                ## Stop capture
+                QApplication.processEvents()
+                time.sleep(0.1)
+                self.device.requeue_buffer(image_buffer)
+                self.device.stop_stream()
+                self.capture_button.setEnabled(True)   
+        
+        
+        # === GLOBAL ANGLE OF POLARIZATION FORMAT (AOPG) ===       
+        elif format_selected == "Global Angle of Polarization (AOPG)": 
+            # INSPIRED FROM : C:\ProgramData\Lucid Vision Labs\ArenaView\ArenaJp\Jupyter Source Code Examples\py_image_buffer_save_PolarizedDolpAolp_BayerRG8_to_png_with_opencv
+
+            # Setup stream nodes
+            tl_stream_nodemap = self.device.tl_stream_nodemap
+            
+            # Auto-exposition avant capture
+            self.auto_expose(target_mean=90, tolerance=15, max_iter=8)
+
+            exposure_node = self.device.nodemap.get_node("ExposureTime")
+            gain_node = self.device.nodemap.get_node("Gain")
+            exposure_value = exposure_node.value
+            gain_value = gain_node.value
+            
+
+            tl_stream_nodemap['StreamAutoNegotiatePacketSize'].value = True
+            tl_stream_nodemap['StreamPacketResendEnable'].value = True
+            
+            # Configure camera nodes
+            nodes = self.device.nodemap.get_node(['Width', 'Height', 'PixelFormat'])
+            nodes['Width'].value = nodes['Width'].max
+            height = nodes['Height']
+            height.value = height.max
+
+            # Set pixel format to PolarizedDolpAolp_Mono8++++++
+        
+            nodes['PixelFormat'].value = 'PolarizedDolpAolp_BayerRG8'
+
+            
+            # RGB application 
+            def scale_linear_bycolumn(rawpoints, high=255.0, low=0.0):
+                mins = np.min(rawpoints, axis=0)
+                maxs = np.max(rawpoints, axis=0) 
+                rng = maxs - mins
+                return high - (((high - low) * (maxs - rawpoints)) / rng)
+            
+            # Capture
+            with self.device.start_stream():
+                image_buffer = self.device.get_buffer()  
+                raw = np.ctypeslib.as_array(
+                    image_buffer.pdata,
+                    shape=(image_buffer.height, image_buffer.width)
+                ).astype(np.float32)
+
+
+                print("Buffer shape:", raw.shape)
+                print("Buffer width:", image_buffer.width)
+                print("Buffer height:", image_buffer.height)
+                print("Raw min/max/mean:", raw.min(), raw.max(), raw.mean())
+
+                h = image_buffer.height // 2
+                DoLP_full = raw[0:h, :]    # (512, 1224) — 0-255 = 0%-100%
+                AoLP_full = raw[h:2*h, :]  # (512, 1224) — 0-255 = 0°-180°
+
+                # Calcul direct sans extraction canal
+                S0_safe = np.where(DoLP_full > 1, DoLP_full, 1)
+
+                # Redimensionner AoLP_full en carré avant traitement
+                h_orig, w_orig = AoLP_full.shape
+                carre = max(h_orig, w_orig)  # 1224 dans votre cas
+
+                AoLP_c = cv2.resize(
+                    AoLP_full.astype(np.float32),
+                    (carre, carre),
+                    interpolation=cv2.INTER_LINEAR
+                )
+
+                DoLP_c = cv2.resize(
+                    DoLP_full.astype(np.float32),
+                    (carre, carre),
+                    interpolation=cv2.INTER_LINEAR
+                )
+
+
+                # Convertir en degrés uniquement sur pixels valides
+                aolp_input = (AoLP_c * 180.0 / 255.0).astype(np.float32)
+                   
+               
+
+                # Appel Hough uniquement sur pixels valides
+                AZIMUT_OFFSET = 0.0
+
+                Az_sun_est, line_angle = detect_sun_line_hough(
+                    aolp_input,
+                    AZIMUT_OFFSET,
+                    epsilon_deg=10
+                )
+
+                if Az_sun_est is not None:
+                    print(f"Azimut solaire : {Az_sun_est:.1f}°")
+    
+                    # Visualisation sur image masquée
+                    viz = visualiser_hough(
+                        aolp_input,
+                        Az_sun_est,
+                        line_angle,
+                        epsilon_deg=10
+                    )
+    
+                    
+    
+                    cv2.imshow("Hough AoLP masqué", viz)
+                    cv2.waitKey(1)
+                else:
+                    print("⚠️ Hough échoué — augmenter epsilon_deg ou vérifier les masques")
+
+
+
+                # Colormap AoLP
+                AoLP_norm = cv2.normalize(
+                    AoLP_c, None,
+                    alpha=0, beta=255,
+                    norm_type=cv2.NORM_MINMAX
+                ).astype(np.uint8)
+                
+               
+                cm_nparray = cv2.applyColorMap(AoLP_norm, cv2.COLORMAP_HSV)
+
+                # Masque DoLP — garder pixels bien polarisés
+                masque_dolp = (DoLP_c > 0.1).astype(np.uint8) * 255
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+                masque_propre = cv2.morphologyEx(masque_dolp, cv2.MORPH_OPEN, kernel)
+                masque_propre = cv2.morphologyEx(masque_propre, cv2.MORPH_CLOSE, kernel)
+
+                print(f"Masque DoPL : {(masque_propre>0).mean()*100:.1f}% retenus")
+
+                # Morphologie pour nettoyer
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                masque_propre = cv2.morphologyEx(masque_propre, cv2.MORPH_OPEN, kernel)
+                masque_propre = cv2.morphologyEx(masque_propre, cv2.MORPH_CLOSE, kernel)
+                pct_uniforme_propre = (masque_propre > 0).mean() * 100
+                print(f"Masque uniformité après morphologie : {pct_uniforme_propre:.1f}% retenus")
+
+
+
+                # === MASQUE UNIFORMITÉ LOCALE ===
+
+                
+                AoLP_f32 = AoLP_c.astype(np.float32)
+
+                # Mean locale
+                local_mean = cv2.blur(AoLP_f32, (11, 11))
+
+                # Mean des carrés locale
+                local_mean_sq = cv2.blur(AoLP_f32**2, (11, 11))
+
+                # Std locale
+                local_std = np.sqrt(np.maximum(local_mean_sq - local_mean**2, 0))
+
+                print(f"local_std min/max/mean: {local_std.min():.1f} {local_std.max():.1f} {local_std.mean():.1f}")
+
+                for seuil in [50, 60, 70, 75, 80, 85, 90]:
+                    masque_test = local_std < seuil
+                    print(f"  std < {seuil} → {masque_test.mean()*100:.1f}% retenus")
+
+                # Afficher la distribution de local_std
+                percentiles = np.percentile(local_std, [10, 25, 50, 75, 90])
+                print(f"Percentiles local_std [10,25,50,75,90]: {percentiles.astype(int)}")
+
+                # Seuil à ajuster selon les résultats
+                seuil_std = 75
+                masque_uniforme = (local_std < seuil_std).astype(np.uint8) * 255
+
+                pct_uniforme = (masque_uniforme > 0).mean() * 100
+                print(f"Masque uniformité (std<{seuil_std}) : {pct_uniforme:.1f}% retenus")
+
+                # Morphologie pour nettoyer
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                masque_uniforme = cv2.morphologyEx(masque_uniforme, cv2.MORPH_OPEN, kernel)
+                masque_uniforme = cv2.morphologyEx(masque_uniforme, cv2.MORPH_CLOSE, kernel)
+                pct_uniforme_propre = (masque_uniforme > 0).mean() * 100
+                print(f"Masque uniformité après morphologie : {pct_uniforme_propre:.1f}% retenus")
+
+                # Combiner avec masque DoLP existant
+                masque_final = cv2.bitwise_and(masque_propre, masque_uniforme)
+                pct_final = (masque_final > 0).mean() * 100
+                print(f"Masque final DoLP + Uniformité : {pct_final:.1f}% retenus")
+
+                # Appliquer masque final
+                masque_3ch = cv2.merge([masque_final, masque_final, masque_final])
+                
+                cm_nparray[masque_3ch == 0] = 0
+
+                # Resize
+                cm_nparray = cv2.resize(
+                    cm_nparray,
+                    (image_buffer.width , image_buffer.height),
+                    interpolation=cv2.INTER_NEAREST
+                )
+
+                # Après application de tous vos masques (masque_final)
+                # AoLP_full masqué
+                AoLP_masked = AoLP_c.copy()
+                AoLP_masked[masque_final == 0] = -1  # marquer pixels masqués
+
+                # Convertir en degrés uniquement sur pixels valides
+                AoLP_deg_full = np.where(
+                    masque_final > 0,
+                    AoLP_c * 180.0 / 255.0,
+                    -1.0  # valeur sentinelle pour pixels masqués
+                )
+
+                print(f"Pixels valides pour Hough : {(AoLP_deg_full >= 0).mean()*100:.1f}%")
+
+                # Appel Hough uniquement sur pixels valides
+                AZIMUT_OFFSET = 0.0
+
+                Az_sun_est, line_angle = detect_sun_line_hough(
+                    np.where(AoLP_deg_full >= 0, AoLP_deg_full, 0),  # remplacer -1 par 0
+                    AZIMUT_OFFSET,
+                    epsilon_deg=10
+                )
+
+                if Az_sun_est is not None:
+                    print(f"Azimut solaire : {Az_sun_est:.1f}°")
+    
+                    # Visualisation sur image masquée
+                    viz = visualiser_hough(
+                        np.where(AoLP_deg_full >= 0, AoLP_deg_full, 0),
+                        Az_sun_est,
+                        line_angle,
+                        epsilon_deg=10
+                    )
+    
+                    # Appliquer le masque sur la visualisation aussi
+                    masque_viz = cv2.resize(
+                        masque_final,
+                        (viz.shape[1], viz.shape[0]),
+                        interpolation=cv2.INTER_NEAREST
+                    )
+                    viz[masque_viz == 0] = 0
+    
+                    cv2.imshow("Hough AoLP masqué", viz)
+                    cv2.waitKey(1)
+                else:
+                    print("⚠️ Hough échoué — augmenter epsilon_deg ou vérifier les masques")
+                
+            
+                
+                # Qt part
+                height, width, channel = cm_nparray.shape
+                bytes_per_line = 3 * width
+                qimg = QImage(cm_nparray.data, width, height, bytes_per_line, QImage.Format_RGB888)
+                
+                # Cliquable label with the image (Right clic on the image with the mouse)
+                label = ClickableLabel() 
+                label.setFixedSize(550, 350)
+                label.setAlignment(Qt.AlignCenter)
+                label.setPixmap(QPixmap.fromImage(qimg).scaled(550, 350, Qt.KeepAspectRatio))
+                label.image_data = cm_nparray.copy()
+                label.filename = f"AOPG_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_G:{gain_value}_E:{exposure_value}.png"
+
+                ## Title above
+                title = QLabel(f"{format_selected} on {datetime.datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
+                title.setAlignment(Qt.AlignCenter)
+                title.setStyleSheet("color: grey; font-weight: bold; font-size: 14px")
+                
+                ## Creation of Colorbar below
+                # colorbar via matplotlib
+                fig, ax = plt.subplots(figsize=(5, 0.5))
+                fig.subplots_adjust(bottom=0.5)
+
+                # vmin, vmax according to the format
+                norm = colors.Normalize(vmin=0, vmax=180)
+                cbar = plt.colorbar(
+                    plt.cm.ScalarMappable(norm=norm, cmap='hsv'),
+                    cax=ax,
+                    orientation='horizontal'
+                )
+                cbar.set_label('Global Angle of Polarization - AOPG (°)')
+
+                ## Save buffer in the memory
+                buf = BytesIO()
+                plt.savefig(buf, format='png', bbox_inches='tight', pad_inches=0.1)
+                plt.close(fig)  
+
+                ## Reading the captured buffer and conversion for Qt
+                buf.seek(0)
+                colorbar_array = np.frombuffer(buf.getvalue(), dtype=np.uint8)
+                colorbar_img = cv2.imdecode(colorbar_array, cv2.IMREAD_COLOR)
+
+                # Conversion to QPixmap
+                height, width, channel = colorbar_img.shape
+                bytes_per_line = 3 * width
+                qimg_bar = QImage(colorbar_img.data, width, height, bytes_per_line, QImage.Format_RGB888)
+                qpixmap_bar = QPixmap.fromImage(qimg_bar)
+
+                ## Add colorbar below the image
+                bar_label = QLabel()
+                bar_label.setPixmap(qpixmap_bar)
+                bar_label.setAlignment(Qt.AlignCenter)
+                
+                ## Display result
+                if len(self.result_widgets) >= 9:
+                    self.result_widgets.pop(0)
+
+                self.result_widgets.append((title, label, bar_label))
+                self.rafraichir_grille_resultats()
+                
+                ## Stop capture
+                QApplication.processEvents()
+                time.sleep(0.1)
+                self.device.requeue_buffer(image_buffer)
+                self.device.stop_stream()
+                self.capture_button.setEnabled(True)
+                
+        # === LOCAL ANGLE OF POLARIZATION FORMAT (AOPL) ===        
+        elif format_selected == "Local Angle of Polarization (AOPL)": 
+            
+            # ---- We start with capturing AoPG ---
+           
+            # Setup stream nodes
+            tl_stream_nodemap = self.device.tl_stream_nodemap
+            
+            gain_node = self.device.nodemap.get_node("Gain")
+            exposure_node = self.device.nodemap.get_node("ExposureTime")
+            gain_value = self.gain_slider.value()
+            exposure_value = self.expo_slider.value()
+            if gain_node:
+                gain_node.value = float(gain_value)
+            if exposure_node:
+                exposure_node.value = float(exposure_value)
+            
+            tl_stream_nodemap['StreamAutoNegotiatePacketSize'].value = True
+            tl_stream_nodemap['StreamPacketResendEnable'].value = True
+            
+            # Configure camera nodes
+            nodes = self.device.nodemap.get_node(['Width', 'Height', 'PixelFormat'])
+            nodes['Width'].value = nodes['Width'].max
+            height = nodes['Height']
+            height.value = height.max
+
+            # Set pixel format to PolarizedDolpAolp_BayerRG8
+            pixel_format_name = 'PolarizedDolpAolp_BayerRG8'
+            nodes['PixelFormat'].value = pixel_format_name
+            
+            # RGB application 
+            def scale_linear_bycolumn(rawpoints, high=255.0, low=0.0):
+                mins = np.min(rawpoints, axis=0)
+                maxs = np.max(rawpoints, axis=0)
+                rng = maxs - mins
+                return high - (((high - low) * (maxs - rawpoints)) / rng)
+            
+            # Capture 
+            with self.device.start_stream():
+                image_buffer = self.device.get_buffer()                
+                nparray_reshaped = np.ctypeslib.as_array(image_buffer.pdata, shape=(image_buffer.height, image_buffer.width))
+                
+                # ---- We take the AoPG format buffer to get the AoPG. Then we deduct our AoPL from the latter ---
+                ## AOPG (mono8 bits) 
+                AOPG = nparray_reshaped
+                AOPG = AOPG.astype(np.float32)
+
+                ## Normalization of the values max > 180 (ex: 0–255)
+                if AOPG.max() > 180:
+                    AOPG = AOPG * (180.0 / 255.0)
+
+                ## Deduction of mathematical coordinates from image shape
+                h, v = AOPG.shape
+
+                # X coordinates (colums)
+                X = np.tile(np.arange(v), (h, 1))
+
+                # Y coordinates (lines)
+                Y = np.tile(np.arange(h).reshape(h, 1), (1, v))
+
+                # Image center, obtained from Scaramuzza calibration. Different from one camera to another.
+                x_centre = 1211.2222  # Horizontal optic axe
+                y_centre = 1027.6125  # Vertical optic axe
+
+                # Offset from the center
+                Xc = X - x_centre
+                Yc = Y - y_centre
+
+                # φ(x, y) calculation, and fix the degree between [0°, 180°]
+                phi_radians = np.arctan2(Yc, Xc)
+                phi_degrees = np.degrees(phi_radians)
+                phi_degrees = np.mod(phi_degrees, 180)
+
+                ## AOPL calculation
+                AOPL = np.mod(AOPG - phi_degrees, 180)          
+
+                ## Image
+                # Image conversion for colormap
+                image_float = AOPL.astype(np.float32)
+                image_float = np.nan_to_num(image_float)
+                image_norm = cv2.normalize(image_float, None, 0, 255, cv2.NORM_MINMAX)
+                image_uint8 = image_norm.astype(np.uint8)
+                cm_nparray = cv2.applyColorMap(image_uint8, cv2.COLORMAP_HSV)
+
+                # Qt part
+                height, width, channel = cm_nparray.shape
+                bytes_per_line = 3 * width
+                qimg = QImage(cm_nparray.data, width, height, bytes_per_line, QImage.Format_RGB888)
+                
+                # Cliquable label with the image (Right clic on the image with the mouse)
+                label = ClickableLabel()
+                label.setFixedSize(550, 350)
+                label.setAlignment(Qt.AlignCenter)
+                label.setPixmap(QPixmap.fromImage(qimg).scaled(550, 350, Qt.KeepAspectRatio))
+                label.image_data = cm_nparray.copy()
+                label.filename = f"AOPL_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_G:{gain_value}_E:{exposure_value}.png"
+
+                ## Title above
+                title = QLabel(f"{format_selected} on {datetime.datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
+                title.setAlignment(Qt.AlignCenter)
+                title.setStyleSheet("color: grey; font-weight: bold; font-size: 14px")
+                
+                ## Creation of Colorbar below
+                # colorbar via matplotlib
+                fig, ax = plt.subplots(figsize=(5, 0.5))
+                fig.subplots_adjust(bottom=0.5)
+
+                # vmin, vmax according to the format
+                norm = colors.Normalize(vmin=0, vmax=180)
+                cbar = plt.colorbar(
+                    plt.cm.ScalarMappable(norm=norm, cmap='hsv'),
+                    cax=ax,
+                    orientation='horizontal'
+                )
+                cbar.set_label('Local Angle of Polarization - AOPL (°)')
+
+                ## Save buffer in the memory
+                buf = BytesIO()
+                plt.savefig(buf, format='png', bbox_inches='tight', pad_inches=0.1)
+                plt.close(fig)  
+
+                ## Reading the captured buffer and conversion for Qt
+                buf.seek(0)
+                colorbar_array = np.frombuffer(buf.getvalue(), dtype=np.uint8)
+                colorbar_img = cv2.imdecode(colorbar_array, cv2.IMREAD_COLOR)
+
+                # Conversion to QPixmap
+                height, width, channel = colorbar_img.shape
+                bytes_per_line = 3 * width
+                qimg_bar = QImage(colorbar_img.data, width, height, bytes_per_line, QImage.Format_RGB888)
+                qpixmap_bar = QPixmap.fromImage(qimg_bar)
+
+                ## Add colorbar below the image
+                bar_label = QLabel()
+                bar_label.setPixmap(qpixmap_bar)
+                bar_label.setAlignment(Qt.AlignCenter)
+                
+                ## Display result
+                if len(self.result_widgets) >= 9:
+                    self.result_widgets.pop(0)
+
+                self.result_widgets.append((title, label, bar_label))
+                self.rafraichir_grille_resultats()
+                
+                ## Stop capture
+                QApplication.processEvents()
+                time.sleep(0.1)
+                self.device.requeue_buffer(image_buffer)
+                self.device.stop_stream()
+
+
+    # Open a dialog to select the save directory for acquisitions
+    def select_save_path(self):
+        folder_path = QFileDialog.getExistingDirectory(self, "Select Save Directory")
+        if folder_path:
+            self.path_line_edit.setText(folder_path)
+    
+    
+    # Stop the image series acquisition if the timer is active
+    def arreter_acquisition(self):
+        if self.timer and self.timer.isActive():
+            self.timer.stop()
+            self.device.stop_stream()
+        self.capture_button.setEnabled(True)
+
+    
+    # Launch a series of image captures based on GUI parameters. Then save raw image + matrice, DoP, AOPG, and computed AOPL for each step
+    def lancer_acquisition(self):
+        self.acquisition_start_button.setEnabled(False)
+        self.acquisition_stop_button.setEnabled(True)
+
+        # === Acquisition parameters from the GUI ===
+        total_duration = self.duration_spinbox.value()
+        total_unit = self.duration_unit_combobox.currentText()
+        interval = self.interval_spinbox.value()
+        interval_unit = self.interval_unit_combobox.currentText()
+        save_path = self.path_line_edit.text()
+
+        if save_path == "No directory selected":
+            QMessageBox.warning(self, "Warning", "Please select a save directory before starting acquisition.")
+            return
+
+        # === Time conversion into seconds ===
+        unit_to_seconds = {"miliseconds":0.001,"seconds": 1, "minutes": 60, "hours": 3600, "days": 86400}
+        total_seconds = total_duration * unit_to_seconds[total_unit]
+        interval_seconds = interval * unit_to_seconds[interval_unit]
+        n_images = int(total_seconds // interval_seconds)
+        
+        # Counting buffers
+        self.progress_bar.setMaximum(int(n_images))
+        self.progress_bar.setValue(0)
+        print(f"Starting acquisition for {n_images} images.")
+
+        self.acquisition_layout.addWidget(QLabel("Acquisition started..."))
+        QApplication.processEvents()
+
+        ## CAPTURE
+        try:
+            # Camera settings
+            # Auto-exposition avant capture
+            self.auto_expose(target_mean=30, tolerance=15, max_iter=8)
+
+            for i in range(1, n_images + 1):
+                timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+
+            
+
+                exposure_node = self.device.nodemap.get_node("ExposureTime")
+                gain_node = self.device.nodemap.get_node("Gain")
+                exposure_value = exposure_node.value
+                gain_value = gain_node.value
+                
+                # Setup stream nodes
+                self.tl_stream_nodemap['StreamAutoNegotiatePacketSize'].value = True
+                self.tl_stream_nodemap['StreamPacketResendEnable'].value = True
+
+                nodes = self.device.nodemap.get_node(['Width', 'Height', 'PixelFormat'])
+                nodes['Width'].value = nodes['Width'].max
+                nodes['Height'].value = nodes['Height'].max
+                nodes['PixelFormat'].value = 'Mono12' 
+
+                width = nodes['Width'].value
+                height = nodes['Height'].value
+
+                # === RAW IMAGE IN MONO12 FORMAT ===
+                with self.device.start_stream():
+                    image_buffer = self.device.get_buffer()
+                    raw_bytes = bytes(image_buffer.data)
+
+                    # 16 bits images (1 pixel = 2 bits in Mono12)
+                    image_16bit = np.frombuffer(raw_bytes, dtype=np.uint16).reshape((height, width))
+
+                    green1 = image_16bit[0::2, 1::2]
+                    green2 = image_16bit[1::2, 0::2]
+
+                    green = ((green1.astype(np.uint32) +
+                              green2.astype(np.uint32)) // 2).astype(np.uint16)
+
+                    green_norm = cv2.normalize(
+                        green.astype(np.float32), None,
+                        alpha=0, beta=255,
+                        norm_type=cv2.NORM_MINMAX
+                    ).astype(np.uint8)
+
+                    image_8bit = green_norm
+
+               
+
+                    
+                    # Save PNG 8-bit
+                    raw1_filename = f"{i}_Raw_image_{timestamp}_G:{gain_value}_E:{exposure_value}.png"
+                    raw_path = os.path.join(save_path, raw1_filename)
+                    cv2.imwrite(raw_path, image_8bit)
+
+                    # Save .mat with raw data 12-bit without changing anything
+                    raw2_filename = f"{i}_Raw_image_{timestamp}.mat"
+                    sio.savemat(os.path.join(save_path, raw2_filename), {"ImageMono12": image_16bit, "Gain_dB": gain_value, "Exposure_us": exposure_value})
+
+                    # Display raw 8-bit image with PyQt
+                    raw_label = QLabel()
+                    raw_label.setFixedSize(400, 250)
+                    qimg = QImage(
+                        image_8bit.data,
+                        image_8bit.shape[1],
+                        image_8bit.shape[0],
+                        image_8bit.strides[0],
+                        QImage.Format_Grayscale8
+                    )
+                    pixmap = QPixmap.fromImage(qimg).scaled(400, 250, Qt.KeepAspectRatio)
+                    raw_label.setPixmap(pixmap)
+
+                    # Title
+                    title = QLabel(f"RAW Mono12 image - number {i} - {timestamp}")
+                    title.setStyleSheet("font-weight: bold; font-size: 13px")
+
+                    # Add raw image + title 
+                    self.acquisition_layout.addWidget(title)
+                    self.acquisition_layout.addWidget(raw_label)
+
+                    # Stop capture
+                    self.device.requeue_buffer(image_buffer)
+                    self.device.stop_stream()
+
+
+                # === Display text & pregression feedback ===
+                info_label = QLabel(f"✅ Raw image : {raw2_filename} saved")
+                info_label.setStyleSheet("font-size: 12px; color: black")
+                self.acquisition_layout.addWidget(info_label)
+                
+                self.progress_bar.setValue(i)
+                QApplication.processEvents()
+                time.sleep(interval_seconds)
+
+        except Exception as e:
+            QMessageBox.critical(self, "Acquisition Error", str(e))
+            print("Exception during acquisition:", str(e))
+
+        finally:
+            self.acquisition_layout.addWidget(QLabel("Acquisition completed."))
+            self.acquisition_start_button.setEnabled(True)
+            self.acquisition_stop_button.setEnabled(False)
+            
+            
+            
+
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    gui = ArenaLikeGUI()
+    gui.show()
+    sys.exit(app.exec_())
